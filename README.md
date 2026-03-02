@@ -23,13 +23,19 @@ Plugin QGIS para execução automatizada do pipeline completo de vetorização m
 
 - **Execução em background** — pipeline roda em `QgsTask` (thread segura), mantendo o QGIS responsivo durante o processamento
 
-- **Log em arquivo** — gerado automaticamente na pasta de upload (ou pasta de saída) a cada execução: `pipeline_YYYYMMDD_HHMMSS.log`
+- **Log em tempo real** — cada linha de saída dos scripts é exibida imediatamente no painel de log (sem agrupamento em lotes); gerado também em arquivo a cada execução: `pipeline_YYYYMMDD_HHMMSS.log`
 
 - **Cancelamento** — interrompe o processo em andamento a qualquer momento
 
 - **Validação de caminhos** — verifica existência de arquivos e pastas antes de iniciar; oferece criação automática de pastas faltantes
 
 - **Carga automática de resultado** — ao concluir com sucesso, carrega o shapefile resultante diretamente no mapa do QGIS (suporta leitura de `shape.zip` via `/vsizip/` sem extração)
+
+- **Reprojeção automática de CRS** — se a grade de articulação estiver em sistema de coordenadas diferente do raster, é reprojetada automaticamente antes da vetorização (comparação semântica via pyproj, não por string)
+
+- **Tooltips contextuais** — ao passar o cursor sobre os campos principais (raster, grade, pastas, modo de pipeline, DN, tolerância D-P, workers, tamanho alvo), uma dica explicativa é exibida
+
+- **Persistência de configurações** — todos os campos (caminhos, parâmetros, etapas selecionadas, opção de limpeza) são restaurados automaticamente entre sessões via `QSettings`
 
 - **Limpeza de tiles** — opção para remover tiles intermediários ao final do pipeline
 
@@ -100,12 +106,12 @@ pip install fiona rasterio geopandas shapely pandas numpy pyogrio
 1. Abra o plugin pelo menu **GeoPipe** ou pelo ícone na barra de ferramentas
 2. **Arquivos e Pastas** — selecione o raster de entrada e a grade de articulação (camadas abertas no QGIS ou arquivos no disco) e defina as pastas de saída
 3. **Tipo de Pipeline** — escolha o modo adequado ao seu dado
-4. **Vetorização** — selecione a classe DN e ajuste os parâmetros (tolerância Douglas-Peucker, número de workers)
+4. **Vetorização** — selecione a classe DN e ajuste os parâmetros (passe o cursor sobre os campos para ver dicas explicativas)
 5. **Merge / Tabela de Atributos** — preencha os atributos conforme o modo selecionado
-6. **Etapas a Executar** — marque as etapas desejadas
+6. **Etapas a Executar** — marque as etapas desejadas (a seleção é lembrada entre sessões)
 7. Clique em **▶ Executar**
 
-O log de execução é exibido em tempo real na seção **Log** e salvo em arquivo na pasta de upload.
+O log de execução é exibido em tempo real na seção **Log** e salvo em arquivo na pasta de upload. Use o botão **Abrir Log** para inspecionar o arquivo gerado.
 
 ---
 
@@ -133,9 +139,28 @@ geopipe_qgis/
 
 ## Notas Técnicas
 
-- Os scripts são chamados via `subprocess.Popen` com variáveis de ambiente `PIPE_*`, sem qualquer alteração nos scripts originais
+- Os scripts são chamados via `subprocess.Popen` com variáveis de ambiente `PIPE_*`
 - O executável `python.exe` é localizado automaticamente no ambiente OSGeo4W (não usa `sys.executable`, que no QGIS aponta para `qgis-ltr.exe`)
+- O flag `-u` é passado ao Python ao chamar cada script, garantindo saída stdout sem buffer — o log é exibido linha a linha, sem agrupamento em lotes
+- No Windows, `CREATE_NO_WINDOW` é aplicado ao subprocesso para suprimir janelas de terminal durante a execução
+- A reprojeção da grade é feita em memória antes do lançamento dos workers, usando `geopandas.to_crs()` com comparação de CRS via `pyproj.CRS.equals()` (semanticamente correta, não por comparação de string)
 - A leitura de shapefiles dentro de `.zip` após o upload é feita via `/vsizip/` (GDAL nativo), sem extração de arquivos
+- Configurações persistidas via `QSettings("GeoPipe", "GeoPipePlugin")`: caminhos, parâmetros, modo, DN, etapas selecionadas e opção de limpeza
+
+---
+
+## Histórico de Versões
+
+### 1.1.0
+- **Fix** — janela de terminal não aparece mais durante a execução de cada etapa (`CREATE_NO_WINDOW`)
+- **Fix** — log exibido linha a linha em tempo real (flag `-u` no subprocesso + migração para `QPlainTextEdit`)
+- **Fix** — estado dos checkboxes de etapas e da opção "Limpar tiles" agora persistido entre sessões
+- **Feature** — reprojeção automática da grade quando o CRS difere do raster
+- **UX** — tooltips em 11 campos da interface
+- **UX** — default Max Workers reduzido de 30 para 14
+
+### 1.0.0
+- Lançamento inicial
 
 ---
 

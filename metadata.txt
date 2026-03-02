@@ -2,7 +2,7 @@
 name=GeoPipe
 qgisMinimumVersion=3.16
 description=Pipeline de Processamento Geoespacial: vetorização multi-CPU, merge, índice espacial e upload.
-version=1.0.0
+version=1.1.0
 author=Clayton Igarashi
 email=geoigarashi@gmail.com
 about=Plugin para executar o pipeline geoespacial GeoPipe diretamente no QGIS. Suporta modos Padrão (Uso do Solo), Declividade e Livre/Personalizado. Executa scripts de vetorização, merge com atributos, criação de índice espacial, compactação e preparação para upload.

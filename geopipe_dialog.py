@@ -8,15 +8,17 @@ A execução dos scripts ocorre dentro de um QgsTask (thread segura).
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
 from qgis.core import Qgis, QgsApplication, QgsMapLayer, QgsMessageLog, QgsProject, QgsTask
-from qgis.PyQt.QtCore import QTimer, Qt, pyqtSignal
+from qgis.PyQt.QtCore import QSettings, QTimer, Qt, pyqtSignal
 from qgis.PyQt.QtGui import QColor, QFont, QTextCursor
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
@@ -39,7 +41,7 @@ from qgis.PyQt.QtWidgets import (
     QSpacerItem,
     QTableWidget,
     QTableWidgetItem,
-    QTextEdit,
+    QPlainTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -47,6 +49,10 @@ from qgis.PyQt.QtWidgets import (
 _PLUGIN_DIR = Path(__file__).resolve().parent
 _SCRIPT_DIR = _PLUGIN_DIR / "scripts"
 _LOG_DIR = _PLUGIN_DIR / "logs"
+
+_REQUIRED_LIBS = ["rasterio", "fiona", "geopandas", "numpy", "pandas", "shapely", "pyogrio"]
+# Captura padrões "[X/Y]" emitidos por vetorize_multicpu.py
+_TILE_PROGRESS_RE = re.compile(r'\[(\d+)/(\d+)\]')
 
 
 def _find_python() -> str:
@@ -156,6 +162,8 @@ class PipelineTask(QgsTask):
     log_message = pyqtSignal(str)
     progress_update = pyqtSignal(int, str)
     finished_signal = pyqtSignal(bool)  # True = sucesso
+    log_path_signal = pyqtSignal(str)          # caminho do arquivo de log criado
+    step_tile_progress = pyqtSignal(int, int)  # (current, total) — progresso intra-etapa
 
     def __init__(self, selected_steps, env, cleanup, tiles_dir, log_dir: str = ""):
         super().__init__("GeoPipe Pipeline", QgsTask.CanCancel)
@@ -174,6 +182,7 @@ class PipelineTask(QgsTask):
         self._log_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_path = self._log_dir / f"pipeline_{timestamp}.log"
+        self.log_path_signal.emit(str(log_path))
 
         with open(log_path, "w", encoding="utf-8") as log_fh:
 
@@ -214,7 +223,7 @@ class PipelineTask(QgsTask):
                     script_path = _SCRIPT_DIR / script
                     python_exe = _find_python()
                     self._process = subprocess.Popen(
-                        [python_exe, str(script_path)],
+                        [python_exe, "-u", str(script_path)],
                         cwd=str(_SCRIPT_DIR),
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
@@ -222,13 +231,24 @@ class PipelineTask(QgsTask):
                         encoding="utf-8",
                         errors="replace",
                         env=self._env,
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                     )
 
                     for line in self._process.stdout:
                         line = line.rstrip("\n\r")
                         both(f"  {line}")
+                        m = _TILE_PROGRESS_RE.search(line)
+                        if m:
+                            self.step_tile_progress.emit(int(m.group(1)), int(m.group(2)))
                         if self.isCanceled():
                             self._process.terminate()
+                            if sys.platform == "win32":
+                                time.sleep(2)
+                                try:
+                                    if self._process.poll() is None:
+                                        self._process.kill()
+                                except Exception:
+                                    pass
                             break
 
                     self._process.stdout.close()  # evita ResourceWarning
@@ -304,6 +324,15 @@ class PipelineTask(QgsTask):
     def cancel(self):  # noqa: D102
         if self._process and self._process.poll() is None:
             self._process.terminate()
+            if sys.platform == "win32":
+                def _force_kill(proc=self._process):
+                    time.sleep(3)
+                    try:
+                        if proc.poll() is None:
+                            proc.kill()
+                    except Exception:
+                        pass
+                threading.Thread(target=_force_kill, daemon=True).start()
         super().cancel()
 
 
@@ -320,6 +349,8 @@ class GeoPipeDialog(QDialog):
         self.iface = iface
         self._task: PipelineTask | None = None
         self._step_checks: list[QCheckBox] = []
+        self._last_log_path = ""
+        self._current_step_idx = 0
 
         self.setWindowTitle("GeoPipe – Pipeline Geoespacial")
         self.setMinimumSize(920, 900)
@@ -330,6 +361,8 @@ class GeoPipeDialog(QDialog):
         self._on_mode_changed()
         self._populate_rasters()
         self._populate_vectors()
+        self._check_dependencies()
+        self._load_settings()
 
     # ------------------------------------------------------------------
     # Construção da UI
@@ -391,6 +424,11 @@ class GeoPipeDialog(QDialog):
         self._raster_cmb.setEditable(True)
         self._raster_cmb.setInsertPolicy(QComboBox.NoInsert)
         self._raster_cmb.lineEdit().setPlaceholderText("Selecione uma camada aberta ou procure o arquivo (.tif)")
+        self._raster_cmb.setToolTip(
+            "Raster classificado de entrada (.tif).\n"
+            "Selecione uma camada já aberta no QGIS ou\n"
+            "informe o caminho completo do arquivo no disco."
+        )
         row_raster.addWidget(self._raster_cmb)
         btn_raster_refresh = QPushButton("↺")
         btn_raster_refresh.setFixedWidth(28)
@@ -418,6 +456,11 @@ class GeoPipeDialog(QDialog):
         self._grid_cmb.setEditable(True)
         self._grid_cmb.setInsertPolicy(QComboBox.NoInsert)
         self._grid_cmb.lineEdit().setPlaceholderText("Selecione uma camada aberta ou procure o arquivo (.shp)")
+        self._grid_cmb.setToolTip(
+            "Grade de articulação (.shp).\n"
+            "Define os tiles que serão processados em paralelo.\n"
+            "Selecione uma camada aberta no QGIS ou informe o caminho do arquivo."
+        )
         row_grid.addWidget(self._grid_cmb)
         btn_grid_refresh = QPushButton("↺")
         btn_grid_refresh.setFixedWidth(28)
@@ -437,10 +480,23 @@ class GeoPipeDialog(QDialog):
         lay_files.addLayout(row_grid)
         self._tiles_edit, _ = self._add_path_row(lay_files, "Pasta de tiles (saída #1 / entrada #2):", mode="dir",
                                                   placeholder="Pasta onde os tiles serão salvos")
+        self._tiles_edit.setToolTip(
+            "Pasta onde os shapefiles de tiles são salvos (saída da etapa 1)\n"
+            "e de onde são lidos para o merge (entrada da etapa 2).\n"
+            "Deve ter espaço suficiente para todos os tiles gerados."
+        )
         self._output_edit, _ = self._add_path_row(lay_files, "Pasta de entrega final (saída #2–#4):", mode="dir",
                                                    placeholder="Pasta para shapefiles finais (merge, índice, zip)")
+        self._output_edit.setToolTip(
+            "Pasta de entrega final: recebe o shapefile mergeado (etapa 2),\n"
+            "o índice espacial .qix (etapa 3) e os ZIPs por classe (etapa 4)."
+        )
         self._upload_edit, _ = self._add_path_row(lay_files, "Pasta para upload (saída #5):", mode="dir",
                                                    placeholder="Pasta de destino com pastas numeradas (shape.zip)")
+        self._upload_edit.setToolTip(
+            "Pasta de upload: recebe subpastas numeradas com shape.zip (etapa 5).\n"
+            "Estrutura gerada: upload_dir/001/shape.zip, 002/shape.zip, etc."
+        )
         main.addWidget(grp_files)
 
         # ── Tipo de Pipeline ───────────────────────────────────────────
@@ -456,6 +512,22 @@ class GeoPipeDialog(QDialog):
             lay_mode.addWidget(rb)
             rb.toggled.connect(self._on_mode_changed)
 
+        self._rb_padrao.setToolTip(
+            "Vetorização de uso do solo com classes DN.\n"
+            "Preenche atributos padrão da tabela BB Valoração\n"
+            "(agricultura, pastagem, silvicultura, etc.)."
+        )
+        self._rb_decl.setToolTip(
+            "Vetorização de dados de declividade.\n"
+            "Preenche automaticamente os campos FAIXA e NOME\n"
+            "conforme a classe DN selecionada."
+        )
+        self._rb_din.setToolTip(
+            "Modo livre: defina suas próprias colunas, tipos, tamanhos\n"
+            "e valores constantes. Indicado para dados fora dos\n"
+            "padrões BB Valoração ou declividade."
+        )
+
         main.addWidget(grp_mode)
 
         # ── Vetorização ────────────────────────────────────────────────
@@ -467,6 +539,11 @@ class GeoPipeDialog(QDialog):
         row1.addWidget(QLabel("DN (classe):"))
         self._cmb_dn = QComboBox()
         self._cmb_dn.setMinimumWidth(280)
+        self._cmb_dn.setToolTip(
+            "Valor DN (Digital Number) da classe alvo a extrair do raster.\n"
+            "• Modo Padrão: cada DN representa um tipo de uso do solo.\n"
+            "• Modo Declividade: cada DN representa uma faixa de inclinação."
+        )
         row1.addWidget(self._cmb_dn)
 
         self._btn_ler_raster = QPushButton("Ler Raster")
@@ -479,12 +556,24 @@ class GeoPipeDialog(QDialog):
         row1.addWidget(QLabel("Tolerância D-P:"))
         self._tol_edit = QLineEdit("0.0001")
         self._tol_edit.setFixedWidth(80)
+        self._tol_edit.setToolTip(
+            "Tolerância Douglas-Peucker para simplificação dos polígonos (em graus).\n"
+            "• 0.0001 ≈ 11 m no equador — padrão, bom equilíbrio detalhe/tamanho\n"
+            "• Valores menores → mais vértices, arquivos maiores\n"
+            "• Valores maiores → contornos mais suavizados, arquivos menores"
+        )
         row1.addWidget(self._tol_edit)
         row1.addStretch()
 
         row2.addWidget(QLabel("Max Workers:"))
-        self._workers_edit = QLineEdit("30")
+        self._workers_edit = QLineEdit("14")
         self._workers_edit.setFixedWidth(60)
+        self._workers_edit.setToolTip(
+            "Número de processos paralelos usados na vetorização.\n"
+            "• Valores maiores aceleram o processo, mas consomem mais CPU e RAM.\n"
+            "• Recomendado: número de núcleos físicos do processador (ex.: 8, 14, 16).\n"
+            "• Evite ultrapassar o total de threads disponíveis no hardware."
+        )
         row2.addWidget(self._workers_edit)
         row2.addStretch()
 
@@ -502,6 +591,11 @@ class GeoPipeDialog(QDialog):
         row_merge1.addWidget(QLabel("Meta tamanho (MB):"))
         self._mb_edit = QLineEdit("300")
         self._mb_edit.setFixedWidth(60)
+        self._mb_edit.setToolTip(
+            "Tamanho-alvo máximo por arquivo shapefile de saída (em MB).\n"
+            "O merge dividirá os tiles em múltiplos shapefiles\n"
+            "caso o volume total ultrapasse esse limite."
+        )
         row_merge1.addWidget(self._mb_edit)
         row_merge1.addSpacerItem(QSpacerItem(16, 0, QSizePolicy.Fixed))
         self._lbl_uf = QLabel("UF:")
@@ -645,12 +739,22 @@ class GeoPipeDialog(QDialog):
         # ── Log ────────────────────────────────────────────────────────
         grp_log = QGroupBox("Log")
         lay_log = QVBoxLayout(grp_log)
-        self._txt_log = QTextEdit()
+        self._txt_log = QPlainTextEdit()
         self._txt_log.setReadOnly(True)
         self._txt_log.setFont(QFont("Consolas", 9))
         self._txt_log.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4;")
         self._txt_log.setMinimumHeight(200)
         lay_log.addWidget(self._txt_log)
+
+        row_log_btns = QHBoxLayout()
+        self._btn_open_log = QPushButton("Abrir Log")
+        self._btn_open_log.setEnabled(False)
+        self._btn_open_log.setToolTip("Abre o arquivo de log da última execução no editor padrão")
+        self._btn_open_log.clicked.connect(self._open_last_log)
+        row_log_btns.addWidget(self._btn_open_log)
+        row_log_btns.addStretch()
+        lay_log.addLayout(row_log_btns)
+
         main.addWidget(grp_log, stretch=1)
 
         main.addStretch()
@@ -902,8 +1006,8 @@ class GeoPipeDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _log(self, msg: str):
-        """Insere texto no QTextEdit de log (safe para chamar da main thread)."""
-        self._txt_log.append(msg)
+        """Insere texto no QPlainTextEdit de log (safe para chamar da main thread)."""
+        self._txt_log.appendPlainText(msg)
         self._txt_log.moveCursor(QTextCursor.End)
         QgsMessageLog.logMessage(msg, "GeoPipe", Qgis.Info)
 
@@ -1085,6 +1189,20 @@ class GeoPipeDialog(QDialog):
             QMessageBox.warning(self, "Nenhuma Etapa", "Selecione ao menos uma etapa para executar.")
             return
 
+        # ── Validação de tiles vazios ──────────────────────────────────
+        _sel_idx = {i for i, chk in enumerate(self._step_checks) if chk.isChecked()}
+        if 1 in _sel_idx and 0 not in _sel_idx:
+            _tiles = self._tiles_edit.text().strip()
+            if _tiles and Path(_tiles).exists() and not list(Path(_tiles).glob("*.shp")):
+                if QMessageBox.question(
+                    self, "Pasta de Tiles Vazia",
+                    f"A pasta de tiles não contém arquivos .shp:\n{_tiles}\n\n"
+                    "A etapa 2 (Merge) depende dos tiles gerados pela etapa 1.\n\n"
+                    "Deseja continuar mesmo assim?",
+                    QMessageBox.Yes | QMessageBox.No,
+                ) == QMessageBox.No:
+                    return
+
         self._txt_log.clear()
 
         # Determinar lista de steps do modo atual
@@ -1101,10 +1219,35 @@ class GeoPipeDialog(QDialog):
             if chk.isChecked()
         ]
 
+        # ── Confirmação antes de executar ─────────────────────────────
+        if self._rb_padrao.isChecked():
+            _mode_str = "Uso do Solo"
+        elif self._rb_decl.isChecked():
+            _mode_str = "Declividade"
+        else:
+            _mode_str = "Livre/Personalizado"
+        _steps_nums = ", ".join(str(s[0]) for s in selected)
+        _dn_str = self._cmb_dn.currentText() or "(nenhum)"
+        _raster_str = self._get_raster_path() or "(não definido)"
+        _confirm_msg = (
+            f"Modo: {_mode_str}\n"
+            f"Classe DN: {_dn_str}\n"
+            f"Tolerância D-P: {self._tol_edit.text()}  |  Workers: {self._workers_edit.text()}\n"
+            f"Etapas: {_steps_nums}\n"
+            f"Raster: {_raster_str}\n"
+            "\nConfirmar execução?"
+        )
+        if QMessageBox.question(
+            self, "Confirmar Pipeline", _confirm_msg,
+            QMessageBox.Yes | QMessageBox.Cancel,
+        ) != QMessageBox.Yes:
+            return
+
         num_selected = len(selected)
-        self._progress.setMaximum(num_selected)
+        self._progress.setMaximum(num_selected * 100)
         self._progress.setValue(0)
         self._progress.setFormat("Iniciando…")
+        self._current_step_idx = 0
 
         self._set_running(True)
 
@@ -1124,13 +1267,15 @@ class GeoPipeDialog(QDialog):
             log_dir = QFileDialog.getExistingDirectory(self, "Selecione a pasta para salvar o log de execução")
             if not log_dir:
                 self._set_running(False)
-                self._txt_log.append("⚠️  Execução cancelada: pasta de log não informada.")
+                self._txt_log.appendPlainText("⚠️  Execução cancelada: pasta de log não informada.")
                 return
 
         self._task = PipelineTask(selected, env, cleanup, tiles_dir, log_dir)
         self._task.log_message.connect(self._log_from_task)
         self._task.progress_update.connect(self._on_progress_update)
         self._task.finished_signal.connect(self._on_pipeline_finished)
+        self._task.log_path_signal.connect(self._on_log_path_set)
+        self._task.step_tile_progress.connect(self._on_tile_progress)
 
         QgsApplication.taskManager().addTask(self._task)
 
@@ -1140,7 +1285,8 @@ class GeoPipeDialog(QDialog):
         self._log("⚠️  Cancelamento solicitado pelo usuário.")
 
     def _on_progress_update(self, value: int, label: str):
-        self._progress.setValue(value)
+        self._current_step_idx = value
+        self._progress.setValue(value * 100)
         self._progress.setFormat(label)
 
     def _on_pipeline_finished(self, success: bool):
@@ -1181,7 +1327,24 @@ class GeoPipeDialog(QDialog):
                 self._add_vector_layer(str(shps[0]), shps[0].stem)
                 return
 
-        # ── Tentativa 2: shape.zip nas subpastas numeradas do upload ───
+        # ── Tentativa 2: .zip em Zips_Prontos_DN_X (resultado da etapa 4) ─
+        dn = self._get_selected_dn()
+        if output_dir and dn:
+            zips_dir = Path(output_dir) / f"Zips_Prontos_DN_{dn}"
+            if zips_dir.exists():
+                zips = sorted(
+                    zips_dir.glob("*.zip"),
+                    key=lambda f: f.stat().st_mtime,
+                    reverse=True,
+                )
+                if zips:
+                    newest = zips[0]
+                    # Arquivos gravados flat no zip (arcname=file.name)
+                    vsizip_path = f"/vsizip/{newest}/{newest.stem}.shp"
+                    self._add_vector_layer(vsizip_path, newest.stem)
+                    return
+
+        # ── Tentativa 3: shape.zip nas subpastas numeradas do upload (etapa 5) ─
         upload_dir = self._upload_edit.text().strip()
         if not upload_dir or not Path(upload_dir).exists():
             self._log("ℹ️  Nenhuma camada encontrada para carregar no QGIS após o pipeline.")
@@ -1223,6 +1386,166 @@ class GeoPipeDialog(QDialog):
         self._chk_cleanup.setEnabled(not running)
         for chk in self._step_checks:
             chk.setEnabled(not running)
+
+    # ------------------------------------------------------------------
+    # Persistência de configurações
+    # ------------------------------------------------------------------
+
+    def closeEvent(self, event):
+        self._save_settings()
+        super().closeEvent(event)
+
+    def _load_settings(self):
+        s = QSettings("GeoPipe", "GeoPipePlugin")
+        # Modo — deve vir primeiro pois dispara _on_mode_changed via sinal toggled
+        mode = s.value("mode", "padrao")
+        if mode == "declividade":
+            self._rb_decl.setChecked(True)
+        elif mode == "dinamico":
+            self._rb_din.setChecked(True)
+        else:
+            self._rb_padrao.setChecked(True)
+        # Paths
+        raster = s.value("raster_path", "")
+        if raster:
+            self._raster_cmb.setCurrentIndex(-1)
+            self._raster_cmb.lineEdit().setText(raster)
+        grid = s.value("grid_path", "")
+        if grid:
+            self._grid_cmb.setCurrentIndex(-1)
+            self._grid_cmb.lineEdit().setText(grid)
+        self._tiles_edit.setText(s.value("tiles_dir", ""))
+        self._output_edit.setText(s.value("output_dir", ""))
+        self._upload_edit.setText(s.value("upload_dir", ""))
+        # Parâmetros de vetorização
+        self._tol_edit.setText(s.value("tolerance", "0.0001"))
+        self._workers_edit.setText(s.value("workers", "14"))
+        # Parâmetros de merge
+        self._mb_edit.setText(s.value("mb", "300"))
+        self._uf_edit.setText(s.value("uf", "BR"))
+        # Seleção DN (após modo já ter sido restaurado e combobox populado)
+        saved_dn = s.value("dn")
+        if saved_dn is not None:
+            for i in range(self._cmb_dn.count()):
+                if str(self._cmb_dn.itemData(i)) == str(saved_dn):
+                    self._cmb_dn.setCurrentIndex(i)
+                    break
+        # Campos de declividade
+        faixa = s.value("faixa", "")
+        if faixa:
+            self._faixa_edit.setText(faixa)
+        nome = s.value("nome", "")
+        if nome:
+            self._nome_edit.setText(nome)
+        # Colunas dinâmicas
+        dynamic_json = s.value("dynamic_cols", "[]")
+        try:
+            cols = json.loads(dynamic_json)
+            for col in cols:
+                r = self._tbl_dynamic.rowCount()
+                self._tbl_dynamic.insertRow(r)
+                self._tbl_dynamic.setItem(r, 0, QTableWidgetItem(col.get("nome", "")))
+                self._tbl_dynamic.setItem(r, 1, QTableWidgetItem(col.get("tipo", "str")))
+                self._tbl_dynamic.setItem(r, 2, QTableWidgetItem(col.get("tamanho", "254")))
+                self._tbl_dynamic.setItem(r, 3, QTableWidgetItem(col.get("valor", "")))
+        except Exception:
+            pass
+        # Etapas selecionadas — restaurado após modo (que reconstrói os checkboxes)
+        step_states_json = s.value("step_states", "[]")
+        try:
+            step_states = json.loads(step_states_json)
+            for i, chk in enumerate(self._step_checks):
+                if i < len(step_states):
+                    chk.setChecked(bool(step_states[i]))
+        except Exception:
+            pass
+        # Limpeza de tiles
+        cleanup = s.value("cleanup", True)
+        self._chk_cleanup.setChecked(cleanup if isinstance(cleanup, bool) else cleanup == "true")
+
+    def _save_settings(self):
+        s = QSettings("GeoPipe", "GeoPipePlugin")
+        s.setValue("raster_path", self._get_raster_path())
+        s.setValue("grid_path", self._get_grid_path())
+        s.setValue("tiles_dir", self._tiles_edit.text())
+        s.setValue("output_dir", self._output_edit.text())
+        s.setValue("upload_dir", self._upload_edit.text())
+        if self._rb_decl.isChecked():
+            s.setValue("mode", "declividade")
+        elif self._rb_din.isChecked():
+            s.setValue("mode", "dinamico")
+        else:
+            s.setValue("mode", "padrao")
+        s.setValue("tolerance", self._tol_edit.text())
+        s.setValue("workers", self._workers_edit.text())
+        s.setValue("mb", self._mb_edit.text())
+        s.setValue("uf", self._uf_edit.text())
+        s.setValue("dn", str(self._cmb_dn.currentData()))
+        s.setValue("faixa", self._faixa_edit.text())
+        s.setValue("nome", self._nome_edit.text())
+        cols = []
+        for row in range(self._tbl_dynamic.rowCount()):
+            cols.append({
+                "nome": self._tbl_dynamic.item(row, 0).text() if self._tbl_dynamic.item(row, 0) else "",
+                "tipo": self._tbl_dynamic.item(row, 1).text() if self._tbl_dynamic.item(row, 1) else "str",
+                "tamanho": self._tbl_dynamic.item(row, 2).text() if self._tbl_dynamic.item(row, 2) else "254",
+                "valor": self._tbl_dynamic.item(row, 3).text() if self._tbl_dynamic.item(row, 3) else "",
+            })
+        s.setValue("dynamic_cols", json.dumps(cols))
+        s.setValue("step_states", json.dumps([chk.isChecked() for chk in self._step_checks]))
+        s.setValue("cleanup", self._chk_cleanup.isChecked())
+
+    # ------------------------------------------------------------------
+    # Verificação de dependências
+    # ------------------------------------------------------------------
+
+    def _check_dependencies(self):
+        missing = []
+        for lib in _REQUIRED_LIBS:
+            try:
+                __import__(lib)
+            except ImportError:
+                missing.append(lib)
+        if missing:
+            QMessageBox.warning(
+                self,
+                "Dependências não instaladas",
+                "As seguintes bibliotecas Python não foram encontradas no ambiente do QGIS:\n\n"
+                + "\n".join(f"  • {lib}" for lib in missing)
+                + "\n\nInstale via OSGeo4W Shell:\n"
+                f"  pip install {' '.join(missing)}\n\n"
+                "O pipeline falhará sem estas dependências.",
+            )
+
+    # ------------------------------------------------------------------
+    # Log — abrir arquivo externo
+    # ------------------------------------------------------------------
+
+    def _on_log_path_set(self, path: str):
+        self._last_log_path = path
+        self._btn_open_log.setEnabled(True)
+
+    def _open_last_log(self):
+        if self._last_log_path and Path(self._last_log_path).exists():
+            if sys.platform == "win32":
+                os.startfile(self._last_log_path)
+            else:
+                import subprocess as _sp
+                _sp.Popen(["xdg-open", self._last_log_path])
+        else:
+            QMessageBox.information(self, "Log", "Nenhum log disponível ainda.")
+
+    # ------------------------------------------------------------------
+    # Progresso intra-etapa
+    # ------------------------------------------------------------------
+
+    def _on_tile_progress(self, current: int, total: int):
+        if total > 0:
+            step_base = self._current_step_idx * 100
+            within = int((current / total) * 100)
+            new_val = step_base + within
+            if new_val > self._progress.value():
+                self._progress.setValue(new_val)
 
     # ------------------------------------------------------------------
     # Ler classes do raster (modo dinâmico)

@@ -44,8 +44,8 @@ TARGET_CLASS = int(os.environ.get("PIPE_TARGET_CLASS", "8"))
 SIMPLIFY_TOLERANCE = float(os.environ.get("PIPE_SIMPLIFY_TOL", "0.0001"))
 
 # Ajuste conforme seu hardware.
-# Ryzen 9 9950X3D: 16 cores / 32 threads. 30 é um bom valor.
-MAX_WORKERS = int(os.environ.get("PIPE_MAX_WORKERS", "30"))
+# Padrão conservador: 14 workers. Aumente se tiver mais núcleos disponíveis.
+MAX_WORKERS = int(os.environ.get("PIPE_MAX_WORKERS", "14"))
 
 
 def processar_tile_worker(feature_geometry: dict, tile_id: int) -> str:
@@ -115,26 +115,26 @@ def main_paralelo() -> None:
     Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
     print(f"Lendo grade de articulação: {GRID_PATH}")
-    with fiona.open(GRID_PATH, "r") as grade:
-        # Verificação básica de CRS
-        with rasterio.open(RASTER_PATH) as src:
-            # Normalizar strings WKT/Proj para comparação simples
-            # (Ideal seria usar pyproj, mas vamos tentar string match ou aviso)
-            print(f"Raster CRS: {src.crs}")
-            print(f"Grid CRS: {grade.crs}")
+    gdf_grade = gpd.read_file(GRID_PATH)
 
-            # Não abortamos para não parar tudo se for falso positivo, mas avisamos
-            if str(src.crs) != str(grade.crs):
-                print("⚠️  AVISO CRÍTICO: CRS do Raster e do Grid parecem diferentes!")
-                print(
-                    "   Isso pode causar desalinhamento, reamostragem ou perda de dados."
-                )
+    with rasterio.open(RASTER_PATH) as src:
+        raster_crs_wkt = src.crs.to_wkt()
+        print(f"Raster CRS: {src.crs}")
+        print(f"Grid CRS: {gdf_grade.crs}")
 
-        tasks = []
-        for i, feature in enumerate(grade):
-            t_id = feature["properties"].get("id", i)
-            t_geom = feature["geometry"]
-            tasks.append((t_geom, t_id))
+        if not gdf_grade.crs.equals(raster_crs_wkt):
+            print(
+                f"⚠️  CRS diferentes detectados. Reprojetando grade "
+                f"({gdf_grade.crs} → {src.crs})..."
+            )
+            gdf_grade = gdf_grade.to_crs(raster_crs_wkt)
+            print("   Grade reprojetada com sucesso.")
+
+    tasks = []
+    for seq_i, row in enumerate(gdf_grade.itertuples(index=False)):
+        t_id = getattr(row, "id", seq_i)
+        t_geom = row.geometry.__geo_interface__
+        tasks.append((t_geom, t_id))
 
     total_tasks = len(tasks)
     print(

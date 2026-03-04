@@ -25,12 +25,12 @@ class GeoPipePlugin:
         )
         self._action.setToolTip("Abrir o Pipeline Geoespacial GeoPipe")
         self._action.triggered.connect(self.run)
-        self.iface.addPluginToMenu("&GeoPipe", self._action)
+        self.iface.addPluginToMenu("Ferramentas Geo", self._action)
         self.iface.addToolBarIcon(self._action)
 
     def unload(self):
         if self._action:
-            self.iface.removePluginMenu("&GeoPipe", self._action)
+            self.iface.removePluginMenu("Ferramentas Geo", self._action)
             self.iface.removeToolBarIcon(self._action)
             self._action = None
 

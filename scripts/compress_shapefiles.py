@@ -6,18 +6,36 @@ em um único arquivo ZIP pronto para upload/entrega.
 """
 
 import os
+import sys
 import time
 import zipfile
 from pathlib import Path
 
+def _get_required_env(var_name: str, prompt: str) -> str:
+    """Recupera variável de ambiente obrigatória ou solicita entrada interativa."""
+    val = os.environ.get(var_name, "").strip()
+    if val:
+        return val
+    if sys.stdin and sys.stdin.isatty():
+        val = input(prompt).strip()
+        if val:
+            return val
+    raise RuntimeError(
+        f"Configuração obrigatória ausente: variável de ambiente '{var_name}' não definida."
+    )
+
+
 # ── Configuração ───────────────────────────────────────────────────────
-# Lê de variáveis de ambiente (GUI/pipeline) ou solicita via input()
+# Lê de variáveis de ambiente (GUI/pipeline) ou solicita via input() em TTY
 INPUT_DIR = Path(
-    os.environ.get("PIPE_OUTPUT_DIR")
-    or input("Pasta com os shapefiles para compactar: ").strip()
+    _get_required_env("PIPE_OUTPUT_DIR", "Pasta com os shapefiles para compactar: ")
 )
 _dn_class = os.environ.get("PIPE_TARGET_CLASS", "8")
 OUTPUT_DIR = INPUT_DIR / f"Zips_Prontos_DN_{_dn_class}"
+KEEP_UNZIPPED = os.environ.get("PIPE_KEEP_UNZIPPED", "0").strip().lower() in (
+    "1",
+    "true",
+)
 
 # Extensões que compõem um shapefile completo
 SHAPEFILE_EXTENSIONS = [".shp", ".shx", ".dbf", ".prj", ".cpg", ".qpj", ".qix"]
@@ -71,10 +89,13 @@ def zipar_entregaveis() -> None:
         )
         print(f"   Redução: {compression_ratio:.1f}% | Tempo: {elapsed:.2f}s")
 
-        # Remover arquivos originais após compactação bem-sucedida
-        for file in files_to_zip:
-            file.unlink()
-        print(f"   🗑️  {len(files_to_zip)} arquivo(s) original(is) removido(s)")
+        # Remover arquivos originais apenas se não configurado para mantê-los
+        if not KEEP_UNZIPPED:
+            for file in files_to_zip:
+                file.unlink()
+            print(f"   🗑️  {len(files_to_zip)} arquivo(s) original(is) removido(s)")
+        else:
+            print("   📁 Arquivos originais preservados em disco.")
 
     total_time = (time.time() - start_total) / 60
     print(f"\n--- Processo Finalizado em {total_time:.2f} minutos ---")

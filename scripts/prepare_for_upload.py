@@ -13,8 +13,24 @@ import time
 import zipfile
 from pathlib import Path
 
+import sys
+
+def _get_required_env(var_name: str, prompt: str) -> str:
+    """Recupera variável de ambiente obrigatória ou solicita entrada interativa."""
+    val = os.environ.get(var_name, "").strip()
+    if val:
+        return val
+    if sys.stdin and sys.stdin.isatty():
+        val = input(prompt).strip()
+        if val:
+            return val
+    raise RuntimeError(
+        f"Configuração obrigatória ausente: variável de ambiente '{var_name}' não definida."
+    )
+
+
 # ── Configuração ───────────────────────────────────────────────────────
-# Lê de variáveis de ambiente (GUI/pipeline) ou solicita via input()
+# Lê de variáveis de ambiente (GUI/pipeline) ou solicita via input() em TTY
 _zips_env = os.environ.get("PIPE_ZIPS_DIR", "").strip()
 if not _zips_env:
     _output_env = os.environ.get("PIPE_OUTPUT_DIR", "").strip()
@@ -28,15 +44,18 @@ if not _zips_env:
             # Step 5 solo: usa PIPE_OUTPUT_DIR diretamente
             _zips_env = _output_env
     else:
-        _zips_env = input("Pasta com os arquivos ZIP de entrada: ").strip()
+        _zips_env = _get_required_env(
+            "PIPE_ZIPS_DIR", "Pasta com os arquivos ZIP de entrada: "
+        )
 
 INPUT_DIR = Path(_zips_env)
 
 _upload_env = os.environ.get("PIPE_UPLOAD_DIR", "").strip()
 if not _upload_env and not os.environ.get("PIPE_OUTPUT_DIR"):
-    _upload_env = input(
-        f"Pasta de saída para upload (Enter = {INPUT_DIR.parent / 'Upload_Prontos'}): "
-    ).strip()
+    if sys.stdin and sys.stdin.isatty():
+        _upload_env = input(
+            f"Pasta de saída para upload (Enter = {INPUT_DIR.parent / 'Upload_Prontos'}): "
+        ).strip()
 OUTPUT_DIR = Path(_upload_env) if _upload_env else INPUT_DIR.parent / "Upload_Prontos"
 
 BYTES_PER_MB = 1024 * 1024
@@ -62,7 +81,7 @@ def preparar_para_upload() -> None:
 
     for i, zip_path in enumerate(zip_files, 1):
         t0 = time.time()
-        numbered_dir = OUTPUT_DIR / str(i)
+        numbered_dir = OUTPUT_DIR / f"{i:03d}"
         shape_dir = numbered_dir / "shape"
         shape_zip_path = numbered_dir / "shape.zip"
 
@@ -111,7 +130,7 @@ def preparar_para_upload() -> None:
         elapsed = time.time() - t0
 
         print(
-            f"[{i}/{total}] {zip_path.name} → pasta {i}/shape.zip"
+            f"[{i}/{total}] {zip_path.name} → pasta {i:03d}/shape.zip"
             f"  ({files_renamed} arquivos)"
         )
         print(

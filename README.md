@@ -17,15 +17,21 @@ Plugin QGIS para execução automatizada do pipeline completo de vetorização m
 - **3 modos de pipeline** configuráveis na interface:
   - **Uso do Solo** — classes DN com adaptação BB Valoração (agricultura, pastagem, silvicultura, etc.)
   - **Declividade** — campos FAIXA e NOME customizados por faixa de declividade
-  - **Livre/Personalizado** — definição dinâmica de colunas com nome, tipo, tamanho e valor constante
+  - **Livre/Personalizado** — definição dinâmica de colunas com nome, tipo, tamanho e valor constante (com validação estrita de 10 caracteres para compatibilidade DBF/Shapefile)
+
+- **Leitura dinâmica e segura de classes do raster** — botão "Ler Raster" executa a extração de classes assincronamente em `QgsTask` em segundo plano, com barra de progresso, filtragem correta de NoData/NaN e proteção contra rasters contínuos
 
 - **Seleção de camadas abertas** — raster de entrada e grade de articulação podem ser escolhidos diretamente das camadas carregadas no projeto QGIS, ou buscados pelo sistema de arquivos
 
-- **Execução em background** — pipeline roda em `QgsTask` (thread segura), mantendo o QGIS responsivo durante o processamento
+- **Pré-filtro espacial inteligente** — a grade de articulação é filtrada espacialmente pelo bounding box do raster antes do processamento, evitando o despacho desnecessário de milhares de tiles fora da área de estudo
+
+- **Execução em background multi-CPU** — pipeline roda em `QgsTask` (thread segura), mantendo o QGIS responsivo durante todo o processamento; detecção dinâmica do número de workers recomendados
+
+- **Cancelamento seguro de processos** — encerra imediatamente toda a árvore de subprocessos no Windows (`taskkill /F /T`), evitando processos zumbis consumindo CPU
+
+- **Merge de alta performance** — análise e particionamento de polígonos que excedem o limite de 450k vértices de forma vetorizada em C (`shapely.get_num_coordinates`), eliminando gargalos de memória e CPU
 
 - **Log em tempo real** — cada linha de saída dos scripts é exibida imediatamente no painel de log (sem agrupamento em lotes); gerado também em arquivo a cada execução: `pipeline_YYYYMMDD_HHMMSS.log`
-
-- **Cancelamento** — interrompe o processo em andamento a qualquer momento
 
 - **Validação de caminhos** — verifica existência de arquivos e pastas antes de iniciar; oferece criação automática de pastas faltantes
 
@@ -35,9 +41,11 @@ Plugin QGIS para execução automatizada do pipeline completo de vetorização m
 
 - **Tooltips contextuais** — ao passar o cursor sobre os campos principais (raster, grade, pastas, modo de pipeline, DN, tolerância D-P, workers, tamanho alvo), uma dica explicativa é exibida
 
-- **Persistência de configurações** — todos os campos (caminhos, parâmetros, etapas selecionadas, opção de limpeza) são restaurados automaticamente entre sessões via `QSettings`
+- **Persistência de configurações** — todos os campos (caminhos, parâmetros, etapas selecionadas, opções de limpeza e preservação) são restaurados automaticamente entre sessões via `QSettings`
 
-- **Limpeza de tiles** — opção para remover tiles intermediários ao final do pipeline
+- **Limpeza e preservação configuráveis** — opções independentes para remover tiles intermediários e para preservar shapefiles descompactados após a compactação em ZIP
+
+- **Padronização para upload** — organização automática em pastas numeradas sequencialmente com 3 dígitos (`001/shape.zip`, `002/shape.zip`, ...)
 
 ---
 

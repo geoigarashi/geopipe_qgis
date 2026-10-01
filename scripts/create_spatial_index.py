@@ -6,17 +6,37 @@ espaciais em GIS e bancos de dados.
 """
 
 import os
+import sys
 import time
 from pathlib import Path
 
+# Bootstrap e higienização de ambiente (PATH, PROJ_DATA, GDAL_DATA)
+try:
+    import _env_bootstrap  # noqa: F401
+except ImportError:
+    pass
+
 from osgeo import ogr
 
+
+def _get_required_env(var_name: str, prompt: str) -> str:
+    """Recupera variável de ambiente obrigatória ou solicita entrada interativa."""
+    val = os.environ.get(var_name, "").strip()
+    if val:
+        return val
+    if sys.stdin and sys.stdin.isatty():
+        val = input(prompt).strip()
+        if val:
+            return val
+    raise RuntimeError(
+        f"Configuração obrigatória ausente: variável de ambiente '{var_name}' não definida."
+    )
+
+
 # ── Configuração ───────────────────────────────────────────────────────
-# Lê de variáveis de ambiente (GUI/pipeline) ou solicita via input()
-INPUT_DIR = Path(
-    os.environ.get("PIPE_OUTPUT_DIR")
-    or input("Pasta com os shapefiles (.shp): ").strip()
-)
+# Lê de variáveis de ambiente (GUI/pipeline) ou solicita via input() em TTY
+INPUT_DIR = Path(_get_required_env("PIPE_OUTPUT_DIR", "Pasta com os shapefiles (.shp): "))
+
 
 
 def gerar_indices_espaciais() -> None:

@@ -10,25 +10,40 @@ import sys
 import time
 from pathlib import Path
 
+# Bootstrap e higienização de ambiente (PATH, PROJ_DATA, GDAL_DATA)
+try:
+    import _env_bootstrap  # noqa: F401
+except ImportError:
+    pass
+
 import geopandas as gpd
 import pandas as pd
+import numpy as np
+import shapely
 from shapely.geometry import MultiPolygon, Polygon, box
 
-# Correção automática para GDAL_DATA (evita avisos no Windows/Conda)
-if "GDAL_DATA" not in os.environ:
-    gdal_data = Path(sys.exec_prefix) / "Library" / "share" / "gdal"
-    if gdal_data.exists():
-        os.environ["GDAL_DATA"] = str(gdal_data)
+
+def _get_required_env(var_name: str, prompt: str) -> str:
+    """Recupera variável de ambiente obrigatória ou solicita entrada interativa."""
+    val = os.environ.get(var_name, "").strip()
+    if val:
+        return val
+    if sys.stdin and sys.stdin.isatty():
+        val = input(prompt).strip()
+        if val:
+            return val
+    raise RuntimeError(
+        f"Configuração obrigatória ausente: variável de ambiente '{var_name}' não definida."
+    )
+
 
 # ── Configuração ───────────────────────────────────────────────────────
-# Lê de variáveis de ambiente (GUI/pipeline) ou solicita via input()
+# Lê de variáveis de ambiente (GUI/pipeline) ou solicita via input() em TTY
 INPUT_DIR = Path(
-    os.environ.get("PIPE_TILES_DIR")
-    or input("Pasta com os tiles de entrada (.shp): ").strip()
+    _get_required_env("PIPE_TILES_DIR", "Pasta com os tiles de entrada (.shp): ")
 )
 OUTPUT_DIR = Path(
-    os.environ.get("PIPE_OUTPUT_DIR")
-    or input("Pasta de saída (entrega final): ").strip()
+    _get_required_env("PIPE_OUTPUT_DIR", "Pasta de saída (entrega final): ")
 )
 TARGET_SIZE_MB = int(os.environ.get("PIPE_TARGET_SIZE_MB", "300"))
 
@@ -36,21 +51,26 @@ BYTES_PER_MB = 1024 * 1024
 MAX_VERTICES_PER_POLYGON = 450000
 
 
+def count_vertices(geom) -> int:
+    """Retorna a contagem total de vértices de uma geometria."""
+    if geom is None or geom.is_empty:
+        return 0
+    if hasattr(shapely, "get_num_coordinates"):
+        return shapely.get_num_coordinates(geom)
+    if isinstance(geom, Polygon):
+        return len(geom.exterior.coords) + sum(len(i.coords) for i in geom.interiors)
+    elif isinstance(geom, MultiPolygon):
+        return sum(
+            len(p.exterior.coords) + sum(len(i.coords) for i in p.interiors)
+            for p in geom.geoms
+        )
+    return 0
+
+
 def split_polygon(poly: Polygon | MultiPolygon) -> list[Polygon]:
     """Recusively splits a polygon into smaller parts if it exceeds max vertices."""
     # Count total vertices across all parts of the geometry
-    if isinstance(poly, Polygon):
-        vertex_count = len(poly.exterior.coords) + sum(
-            len(i.coords) for i in poly.interiors
-        )
-    elif isinstance(poly, MultiPolygon):
-        vertex_count = sum(
-            len(p.exterior.coords) + sum(len(i.coords) for i in p.interiors)
-            for p in poly.geoms
-        )
-    else:
-        return [poly]
-
+    vertex_count = count_vertices(poly)
     if vertex_count <= MAX_VERTICES_PER_POLYGON:
         return [poly]
 
@@ -111,32 +131,43 @@ def merge_and_save(file_list: list[Path], part_number: int, fid_start: int) -> i
     # 2. União em memória e quebra de excesso de vértices
     print("2. Unindo geometrias e analisando limite de vértices (max 450k)...")
     merged_gdf = gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True), crs=gdfs[0].crs)
+    del gdfs
 
-    # 2.1 Verificar polígonos com mais de 450k vértices
-    new_geometries = []
-    has_split = False
+    # Verificação rápida e vetorizada de contagem de vértices
+    if hasattr(shapely, "get_num_coordinates"):
+        vertex_counts = shapely.get_num_coordinates(merged_gdf.geometry.values)
+    else:
+        vertex_counts = np.array(
+            [count_vertices(g) for g in merged_gdf.geometry.values]
+        )
 
-    for _, row in merged_gdf.iterrows():
-        geom = row["geometry"]
-        if geom is None or geom.is_empty:
-            continue
+    oversized_mask = vertex_counts > MAX_VERTICES_PER_POLYGON
 
-        parts = split_polygon(geom)
-        if len(parts) > 1:
-            has_split = True
+    if np.any(oversized_mask):
+        num_oversized = int(np.sum(oversized_mask))
+        print(f"    -> {num_oversized} polígono(s) gigante(s) detectado(s). Dividindo...")
+        normal_gdf = merged_gdf.iloc[~oversized_mask]
+        oversized_gdf = merged_gdf.iloc[oversized_mask]
 
-        for p in parts:
-            if not p.is_empty:
-                new_row = row.copy()
-                new_row["geometry"] = p
-                new_geometries.append(new_row)
+        split_rows = []
+        for _, row in oversized_gdf.iterrows():
+            parts = split_polygon(row["geometry"])
+            for p in parts:
+                if not p.is_empty:
+                    new_row = row.copy()
+                    new_row["geometry"] = p
+                    split_rows.append(new_row)
 
-    if has_split:
-        print("    -> Polígonos gigantes foram detectados e divididos com sucesso.")
-        merged_gdf = gpd.GeoDataFrame(new_geometries, crs=gdfs[0].crs)
+        split_gdf = gpd.GeoDataFrame(split_rows, crs=merged_gdf.crs)
+        merged_gdf = gpd.GeoDataFrame(
+            pd.concat([normal_gdf, split_gdf], ignore_index=True),
+            crs=merged_gdf.crs,
+        )
+        print("    -> Polígonos gigantes foram divididos com sucesso.")
+    else:
+        print("    -> Nenhuma geometria excede o limite de 450k vértices.")
 
     qtd_poligonos = len(merged_gdf)
-    del gdfs
 
     # 3. Padronização da tabela de atributos
     print("3. Padronizando tabela de atributos...")

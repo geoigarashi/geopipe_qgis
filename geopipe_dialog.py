@@ -12,19 +12,17 @@ import re
 import shutil
 import subprocess
 import sys
-import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
 from qgis.core import Qgis, QgsApplication, QgsMapLayer, QgsMessageLog, QgsProject, QgsTask
-from qgis.PyQt.QtCore import QSettings, QTimer, Qt, pyqtSignal
-from qgis.PyQt.QtGui import QColor, QFont, QTextCursor
+from qgis.PyQt.QtCore import QSettings, Qt, pyqtSignal
+from qgis.PyQt.QtGui import QFont, QTextCursor
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
-    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGroupBox,
@@ -72,10 +70,9 @@ def _find_python() -> str:
     osgeo4w_root = prefix.parent.parent  # .../OSGeo4W
 
     candidates = [
-        osgeo4w_root / "bin" / "python.exe",            # bin/python.exe  ← OSGeo4W padrao
-        prefix / "python.exe",                          # apps/Python312/python.exe
-        osgeo4w_root / "bin" / "python312.exe",         # bin/python312.exe
+        prefix / "python.exe",                          # apps/Python312/python.exe ← interpretador nativo com libs
         osgeo4w_root / "bin" / "python3.exe",           # bin/python3.exe
+        osgeo4w_root / "bin" / "python.exe",            # bin/python.exe
         prefix.parent / "bin" / "python.exe",           # apps/bin/python.exe
     ]
 
@@ -85,6 +82,7 @@ def _find_python() -> str:
 
     # Fallback: retornar sys.executable mesmo que seja incorreto
     return sys.executable
+
 
 # ── Definição das Etapas ───────────────────────────────────────────────
 PIPELINE_STEPS = [
@@ -151,9 +149,41 @@ DECLIV_DEFAULTS: dict[int, tuple[str, str]] = {
 }
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Task QGIS para execução em background
-# ──────────────────────────────────────────────────────────────────────
+def _kill_process_tree(proc: subprocess.Popen | None) -> None:
+    """Termina um processo e todos os seus processos-filhos no Windows/Unix."""
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                check=False,
+            )
+        else:
+            proc.terminate()
+            proc.wait(timeout=2)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _is_task_running(task: QgsTask | None) -> bool:
+    """Verifica com segurança se uma QgsTask está ativa, evitando RuntimeError por wrapper C++ deletado."""
+    if task is None:
+        return False
+    try:
+        from qgis.PyQt import sip
+        if sip.isdeleted(task):
+            return False
+    except Exception:
+        pass
+    try:
+        return task.status() in (QgsTask.Queued, QgsTask.OnHold, QgsTask.Running)
+    except (RuntimeError, ReferenceError):
+        return False
 
 
 class PipelineTask(QgsTask):
@@ -241,14 +271,7 @@ class PipelineTask(QgsTask):
                         if m:
                             self.step_tile_progress.emit(int(m.group(1)), int(m.group(2)))
                         if self.isCanceled():
-                            self._process.terminate()
-                            if sys.platform == "win32":
-                                time.sleep(2)
-                                try:
-                                    if self._process.poll() is None:
-                                        self._process.kill()
-                                except Exception:
-                                    pass
+                            _kill_process_tree(self._process)
                             break
 
                     self._process.stdout.close()  # evita ResourceWarning
@@ -322,17 +345,7 @@ class PipelineTask(QgsTask):
         self.finished_signal.emit(result)
 
     def cancel(self):  # noqa: D102
-        if self._process and self._process.poll() is None:
-            self._process.terminate()
-            if sys.platform == "win32":
-                def _force_kill(proc=self._process):
-                    time.sleep(3)
-                    try:
-                        if proc.poll() is None:
-                            proc.kill()
-                    except Exception:
-                        pass
-                threading.Thread(target=_force_kill, daemon=True).start()
+        _kill_process_tree(self._process)
         super().cancel()
 
 
@@ -348,6 +361,7 @@ class GeoPipeDialog(QDialog):
         super().__init__(parent)
         self.iface = iface
         self._task: PipelineTask | None = None
+        self._read_task: QgsTask | None = None
         self._step_checks: list[QCheckBox] = []
         self._last_log_path = ""
         self._current_step_idx = 0
@@ -566,7 +580,8 @@ class GeoPipeDialog(QDialog):
         row1.addStretch()
 
         row2.addWidget(QLabel("Max Workers:"))
-        self._workers_edit = QLineEdit("14")
+        default_workers = str(max(1, (os.cpu_count() or 4) - 2))
+        self._workers_edit = QLineEdit(default_workers)
         self._workers_edit.setFixedWidth(60)
         self._workers_edit.setToolTip(
             "Número de processos paralelos usados na vetorização.\n"
@@ -701,6 +716,10 @@ class GeoPipeDialog(QDialog):
         self._chk_cleanup = QCheckBox("Limpar tiles intermediários após conclusão")
         self._chk_cleanup.setChecked(True)
         self._lay_steps.addWidget(self._chk_cleanup)
+
+        self._chk_keep_shp = QCheckBox("Preservar shapefiles descompactados após compactação (.zip)")
+        self._chk_keep_shp.setChecked(False)
+        self._lay_steps.addWidget(self._chk_keep_shp)
 
         # Botões de seleção + Executar/Cancelar
         row_btns = QHBoxLayout()
@@ -973,6 +992,24 @@ class GeoPipeDialog(QDialog):
         if not nome:
             QMessageBox.warning(self, "Aviso", "O nome da coluna é obrigatório.")
             return
+
+        if len(nome) > 10:
+            QMessageBox.warning(
+                self,
+                "Nome de Coluna Inválido",
+                f"O nome da coluna '{nome}' possui {len(nome)} caracteres.\n\n"
+                "O formato Shapefile (dBASE III) limita nomes de coluna a no máximo 10 caracteres.",
+            )
+            return
+
+        if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", nome):
+            QMessageBox.warning(
+                self,
+                "Nome de Coluna Inválido",
+                f"O nome da coluna '{nome}' contém caracteres inválidos.\n\n"
+                "Utilize apenas letras, números e sublinhados (_), iniciando com letra ou sublinhado.",
+            )
+            return
         tipo = self._dyn_tipo_cmb.currentText()
         tam = self._dyn_tam_edit.text().strip()
         val = self._dyn_val_edit.text().strip()
@@ -1133,23 +1170,76 @@ class GeoPipeDialog(QDialog):
     def _build_env(self) -> dict:
         env = os.environ.copy()
 
-        # Garantir GDAL_DATA
-        if "GDAL_DATA" not in env:
-            gdal_data = Path(sys.exec_prefix) / "Library" / "share" / "gdal"
-            if gdal_data.exists():
-                env["GDAL_DATA"] = str(gdal_data)
+        # Determinar raiz OSGeo4W e prefixo Python
+        prefix = Path(sys.exec_prefix)
+        osgeo4w_root = prefix.parent.parent
 
-        # Garantir PROJ_LIB
-        if "PROJ_LIB" not in env:
-            for candidate in [
-                Path(sys.exec_prefix) / "Library" / "share" / "proj",
-                Path(sys.exec_prefix) / "share" / "proj",
-            ]:
-                if candidate.exists():
-                    env["PROJ_LIB"] = str(candidate)
-                    break
+        # ── 1. Diretórios de dados Geoespaciais (PROJ / GDAL) ───────────────
+        proj_candidates = [
+            osgeo4w_root / "share" / "proj",
+            prefix / "Library" / "share" / "proj",
+            prefix / "share" / "proj",
+        ]
+        for p_cand in proj_candidates:
+            if (p_cand / "proj.db").exists():
+                env["PROJ_DATA"] = str(p_cand)
+                env["PROJ_LIB"] = str(p_cand)
+                break
 
+        gdal_candidates = [
+            osgeo4w_root / "apps" / "gdal" / "share" / "gdal",
+            prefix / "Library" / "share" / "gdal",
+            prefix / "share" / "gdal",
+        ]
+        for g_cand in gdal_candidates:
+            if g_cand.is_dir():
+                env["GDAL_DATA"] = str(g_cand)
+                break
+
+        gdal_plugin_candidates = [
+            osgeo4w_root / "apps" / "gdal" / "lib" / "gdalplugins",
+            prefix / "Library" / "lib" / "gdalplugins",
+        ]
+        for gp_cand in gdal_plugin_candidates:
+            if gp_cand.is_dir():
+                env["GDAL_DRIVER_PATH"] = str(gp_cand)
+                break
+
+        # ── 2. PYTHONHOME e Encoding ─────────────────────────────────────────
+        env["PYTHONHOME"] = str(prefix)
+        env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
+
+        # ── 3. Higienização e Priorização do PATH (Windows) ──────────────────
+        if sys.platform == "win32":
+            priority_dirs = [
+                str(osgeo4w_root / "bin"),
+                str(prefix / "Scripts"),
+                str(prefix),
+                str(osgeo4w_root / "apps" / "qgis-ltr" / "bin"),
+            ]
+            existing_priority = [d for d in priority_dirs if Path(d).is_dir()]
+
+            is_osgeo4w = (osgeo4w_root / "bin" / "proj_9.dll").exists() or (
+                osgeo4w_root / "bin" / "o4w_env.bat"
+            ).exists()
+
+            raw_path = env.get("PATH", "").split(os.pathsep)
+            clean_paths: list[str] = []
+            for item in raw_path:
+                item_strip = item.strip()
+                if not item_strip:
+                    continue
+                item_lower = item_strip.lower()
+                # Remove entradas de Conda/Anaconda para evitar sequestro de DLLs (ex: proj_9.dll)
+                if is_osgeo4w and ("miniconda" in item_lower or "anaconda" in item_lower):
+                    continue
+                if item_strip not in existing_priority:
+                    clean_paths.append(item_strip)
+
+            env["PATH"] = os.pathsep.join(existing_priority + clean_paths)
+
+        # ── 4. Variáveis operacionais do GeoPipe ─────────────────────────────
         env["PIPE_RASTER_PATH"] = self._get_raster_path()
         env["PIPE_GRID_PATH"] = self._get_grid_path()
         env["PIPE_TILES_DIR"] = self._tiles_edit.text()
@@ -1163,6 +1253,7 @@ class GeoPipeDialog(QDialog):
         env["PIPE_UPLOAD_DIR"] = self._upload_edit.text()
         env["PIPE_ATTR_FAIXA"] = self._faixa_edit.text()
         env["PIPE_ATTR_NOME"] = self._nome_edit.text()
+        env["PIPE_KEEP_UNZIPPED"] = "1" if self._chk_keep_shp.isChecked() else "0"
 
         if self._rb_din.isChecked():
             dynamic_cols = []
@@ -1176,6 +1267,7 @@ class GeoPipeDialog(QDialog):
             env["PIPE_CUSTOM_SCHEMA"] = json.dumps(dynamic_cols)
 
         return env
+
 
     # ------------------------------------------------------------------
     # Execução
@@ -1280,8 +1372,11 @@ class GeoPipeDialog(QDialog):
         QgsApplication.taskManager().addTask(self._task)
 
     def _on_cancel(self):
-        if self._task:
-            self._task.cancel()
+        if _is_task_running(self._task):
+            try:
+                self._task.cancel()
+            except (RuntimeError, ReferenceError):
+                pass
         self._log("⚠️  Cancelamento solicitado pelo usuário.")
 
     def _on_progress_update(self, value: int, label: str):
@@ -1291,6 +1386,7 @@ class GeoPipeDialog(QDialog):
 
     def _on_pipeline_finished(self, success: bool):
         self._set_running(False)
+        self._task = None
         if success:
             if self.iface:
                 self.iface.messageBar().pushMessage("GeoPipe", "Pipeline concluído com sucesso! 🎉", level=Qgis.Success, duration=5)
@@ -1384,6 +1480,7 @@ class GeoPipeDialog(QDialog):
         self._btn_run.setEnabled(not running)
         self._btn_cancel.setEnabled(running)
         self._chk_cleanup.setEnabled(not running)
+        self._chk_keep_shp.setEnabled(not running)
         for chk in self._step_checks:
             chk.setEnabled(not running)
 
@@ -1392,6 +1489,30 @@ class GeoPipeDialog(QDialog):
     # ------------------------------------------------------------------
 
     def closeEvent(self, event):
+        if _is_task_running(self._task):
+            r = QMessageBox.question(
+                self,
+                "Pipeline em execução",
+                "Existe um processamento do pipeline em andamento.\n\n"
+                "Deseja realmente cancelar a execução e fechar a janela?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if r != QMessageBox.Yes:
+                event.ignore()
+                return
+            try:
+                self._task.cancel()
+            except (RuntimeError, ReferenceError):
+                pass
+
+        if _is_task_running(self._read_task):
+            try:
+                self._read_task.cancel()
+            except (RuntimeError, ReferenceError):
+                pass
+
+        self._task = None
+        self._read_task = None
         self._save_settings()
         super().closeEvent(event)
 
@@ -1419,7 +1540,8 @@ class GeoPipeDialog(QDialog):
         self._upload_edit.setText(s.value("upload_dir", ""))
         # Parâmetros de vetorização
         self._tol_edit.setText(s.value("tolerance", "0.0001"))
-        self._workers_edit.setText(s.value("workers", "14"))
+        default_workers = str(max(1, (os.cpu_count() or 4) - 2))
+        self._workers_edit.setText(s.value("workers", default_workers))
         # Parâmetros de merge
         self._mb_edit.setText(s.value("mb", "300"))
         self._uf_edit.setText(s.value("uf", "BR"))
@@ -1462,6 +1584,8 @@ class GeoPipeDialog(QDialog):
         # Limpeza de tiles
         cleanup = s.value("cleanup", True)
         self._chk_cleanup.setChecked(cleanup if isinstance(cleanup, bool) else cleanup == "true")
+        keep_shp = s.value("keep_unzipped", False)
+        self._chk_keep_shp.setChecked(keep_shp if isinstance(keep_shp, bool) else keep_shp == "true")
 
     def _save_settings(self):
         s = QSettings("GeoPipe", "GeoPipePlugin")
@@ -1494,6 +1618,7 @@ class GeoPipeDialog(QDialog):
         s.setValue("dynamic_cols", json.dumps(cols))
         s.setValue("step_states", json.dumps([chk.isChecked() for chk in self._step_checks]))
         s.setValue("cleanup", self._chk_cleanup.isChecked())
+        s.setValue("keep_unzipped", self._chk_keep_shp.isChecked())
 
     # ------------------------------------------------------------------
     # Verificação de dependências
@@ -1551,70 +1676,216 @@ class GeoPipeDialog(QDialog):
     # Ler classes do raster (modo dinâmico)
     # ------------------------------------------------------------------
 
-    def _load_raster_classes_bg(self):
+    def _load_raster_classes_bg(self) -> None:
+        """Lê as classes únicas do raster em uma QgsTask."""
+
         raster_path = self._get_raster_path()
+
         if not raster_path:
-            QMessageBox.critical(self, "Erro", "Selecione o raster primeiro.")
+            QMessageBox.critical(
+                self,
+                "Erro",
+                "Selecione o raster primeiro.",
+            )
             return
-        p = Path(raster_path)
-        if not p.exists():
-            QMessageBox.critical(self, "Erro", "Raster de entrada não encontrado.")
+
+        raster_file = Path(raster_path)
+
+        if not raster_file.is_file():
+            QMessageBox.critical(
+                self,
+                "Erro",
+                f"Raster de entrada não encontrado:\n{raster_file}",
+            )
+            return
+
+        if _is_task_running(self._read_task):
+            QMessageBox.information(
+                self,
+                "Leitura em andamento",
+                "Já existe uma leitura de raster em andamento.",
+            )
             return
 
         self._btn_ler_raster.setEnabled(False)
-        self._btn_ler_raster.setText("Lendo…")
+        self._btn_ler_raster.setText("Lendo...")
+        self._log(f"Iniciando leitura das classes: {raster_file}")
 
-        from qgis.core import QgsTask
+        dialog = self
 
-        class _ReadTask(QgsTask):
-            log = pyqtSignal(str)
-            classes_found = pyqtSignal(list)
-            error_sig = pyqtSignal(str)
+        class RasterClassesTask(QgsTask):
+            """Tarefa para leitura assíncrona das classes do raster."""
 
-            def __init__(self, path):
-                super().__init__("GeoPipe – Ler Raster", QgsTask.CanCancel)
+            def __init__(self, path: Path) -> None:
+                super().__init__(
+                    "GeoPipe - Ler classes do raster",
+                    QgsTask.CanCancel,
+                )
                 self._path = path
+                self.classes: list[int] = []
+                self.error_message: str = ""
 
-            def run(self):
+            def run(self) -> bool:
+                """Executa a leitura fora da thread principal."""
+
                 try:
                     import numpy as np
                     import rasterio
 
-                    unique_vals = set()
-                    with rasterio.open(self._path) as src:
-                        for _, window in src.block_windows(1):
-                            arr = src.read(1, window=window)
-                            if src.nodata is not None:
-                                unique_vals.update(np.unique(arr[arr != src.nodata]))
+                    unique_values: set[int] = set()
+
+                    with rasterio.open(self._path) as source:
+                        block_height, block_width = source.block_shapes[0]
+
+                        blocks_x = (
+                            source.width + block_width - 1
+                        ) // block_width
+
+                        blocks_y = (
+                            source.height + block_height - 1
+                        ) // block_height
+
+                        total_blocks = max(blocks_x * blocks_y, 1)
+                        processed_blocks = 0
+
+                        for _, window in source.block_windows(1):
+                            if self.isCanceled():
+                                self.error_message = (
+                                    "Leitura cancelada pelo usuário."
+                                )
+                                return False
+
+                            array = source.read(1, window=window)
+
+                            # Filtrar NoData e NaNs com segurança
+                            if source.nodata is not None:
+                                if np.isnan(source.nodata):
+                                    valid_pixels = array[~np.isnan(array)]
+                                else:
+                                    valid_pixels = array[(array != source.nodata) & ~np.isnan(array)]
                             else:
-                                unique_vals.update(np.unique(arr))
-                    classes = sorted([int(x) for x in unique_vals if np.isfinite(x)])
-                    self.classes_found.emit(classes)
+                                valid_pixels = array[~np.isnan(array)]
+
+                            if valid_pixels.size > 0:
+                                values = np.unique(valid_pixels)
+
+                                for value in values:
+                                    if np.isfinite(value):
+                                        unique_values.add(int(value))
+
+                                # Proteção contra rasters contínuos (ex: MDE ou declividade contínua)
+                                if len(unique_values) > 2000:
+                                    self.error_message = (
+                                        "O raster parece conter dados contínuos "
+                                        "(mais de 2.000 valores únicos detectados).\n\n"
+                                        "A vetorização por classes requer um raster "
+                                        "classificado/discreto com poucas classes."
+                                    )
+                                    return False
+
+                            processed_blocks += 1
+                            progress = int(
+                                processed_blocks * 100 / total_blocks
+                            )
+                            self.setProgress(min(progress, 99))
+
+                    self.classes = sorted(unique_values)
+                    self.setProgress(100)
+
                     return True
-                except ImportError:
-                    self.error_sig.emit("Biblioteca 'rasterio' não instalada no Python do QGIS.")
+
+                except ImportError as exc:
+                    self.error_message = (
+                        "Não foi possível importar uma dependência "
+                        f"necessária: {exc}"
+                    )
                     return False
-                except Exception as e:
-                    self.error_sig.emit(str(e))
+
+                except Exception as exc:
+                    self.error_message = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
                     return False
 
-        read_task = _ReadTask(str(p))
+            def finished(self, result: bool) -> None:
+                """Atualiza a interface na thread principal."""
 
-        def _on_classes(classes):
-            self._cmb_dn.blockSignals(True)
-            self._cmb_dn.clear()
-            for c in classes:
-                self._cmb_dn.addItem(str(c), userData=c)
-            self._cmb_dn.blockSignals(False)
-            self._btn_ler_raster.setEnabled(True)
-            self._btn_ler_raster.setText("Ler Raster")
-            self._log(f"Classes lidas: {classes}")
+                dialog._btn_ler_raster.setEnabled(True)
+                dialog._btn_ler_raster.setText("Ler Raster")
+                dialog._read_task = None
 
-        def _on_error(msg):
-            QMessageBox.critical(self, "Erro ao ler raster", msg)
-            self._btn_ler_raster.setEnabled(True)
-            self._btn_ler_raster.setText("Ler Raster")
+                if not result:
+                    message = self.error_message or (
+                        "A tarefa de leitura foi encerrada sem concluir."
+                    )
 
-        read_task.classes_found.connect(_on_classes)
-        read_task.error_sig.connect(_on_error)
-        QgsApplication.taskManager().addTask(read_task)
+                    dialog._log(
+                        f"Erro ao ler as classes do raster: {message}"
+                    )
+
+                    QMessageBox.critical(
+                        dialog,
+                        "Erro ao ler raster",
+                        message,
+                    )
+                    return
+
+                dialog._cmb_dn.blockSignals(True)
+
+                try:
+                    dialog._cmb_dn.clear()
+
+                    for raster_class in self.classes:
+                        dialog._cmb_dn.addItem(
+                            str(raster_class),
+                            userData=raster_class,
+                        )
+                finally:
+                    dialog._cmb_dn.blockSignals(False)
+
+                if self.classes:
+                    dialog._cmb_dn.setCurrentIndex(0)
+
+                    dialog._log(
+                        "Classes encontradas no raster: "
+                        + ", ".join(map(str, self.classes))
+                    )
+
+                    if dialog.iface:
+                        dialog.iface.messageBar().pushMessage(
+                            "GeoPipe",
+                            (
+                                f"{len(self.classes)} classe(s) "
+                                "encontrada(s) no raster."
+                            ),
+                            level=Qgis.Success,
+                            duration=5,
+                        )
+                else:
+                    dialog._log(
+                        "A leitura foi concluída, mas nenhuma classe "
+                        "válida foi encontrada."
+                    )
+
+                    QMessageBox.warning(
+                        dialog,
+                        "Raster sem classes",
+                        (
+                            "Nenhuma classe válida foi encontrada.\n\n"
+                            "Verifique o valor NoData e a banda utilizada."
+                        ),
+                    )
+
+        self._read_task = RasterClassesTask(raster_file)
+
+        if self.iface:
+            self._read_task.progressChanged.connect(
+                lambda progress: self.iface.messageBar().pushMessage(
+                    "GeoPipe",
+                    f"Lendo classes do raster: {int(progress)}%",
+                    level=Qgis.Info,
+                    duration=1,
+                )
+            )
+
+        QgsApplication.taskManager().addTask(self._read_task)

@@ -13,23 +13,35 @@ import sys
 import time
 from pathlib import Path
 
+# Bootstrap e higienização de ambiente (PATH, PROJ_DATA, GDAL_DATA)
+try:
+    import _env_bootstrap  # noqa: F401
+except ImportError:
+    pass
+
 import geopandas as gpd
 import pandas as pd
 
-# Correção automática para GDAL_DATA (evita avisos no Windows/Conda)
-if "GDAL_DATA" not in os.environ:
-    gdal_data = Path(sys.exec_prefix) / "Library" / "share" / "gdal"
-    if gdal_data.exists():
-        os.environ["GDAL_DATA"] = str(gdal_data)
+def _get_required_env(var_name: str, prompt: str) -> str:
+    """Recupera variável de ambiente obrigatória ou solicita entrada interativa."""
+    val = os.environ.get(var_name, "").strip()
+    if val:
+        return val
+    if sys.stdin and sys.stdin.isatty():
+        val = input(prompt).strip()
+        if val:
+            return val
+    raise RuntimeError(
+        f"Configuração obrigatória ausente: variável de ambiente '{var_name}' não definida."
+    )
+
 
 # ── Configuração ───────────────────────────────────────────────────────
 INPUT_DIR = Path(
-    os.environ.get("PIPE_TILES_DIR")
-    or input("Pasta com os tiles de entrada (.shp): ").strip()
+    _get_required_env("PIPE_TILES_DIR", "Pasta com os tiles de entrada (.shp): ")
 )
 OUTPUT_DIR = Path(
-    os.environ.get("PIPE_OUTPUT_DIR")
-    or input("Pasta de saída (entrega final): ").strip()
+    _get_required_env("PIPE_OUTPUT_DIR", "Pasta de saída (entrega final): ")
 )
 TARGET_SIZE_MB = int(os.environ.get("PIPE_TARGET_SIZE_MB", "300"))
 

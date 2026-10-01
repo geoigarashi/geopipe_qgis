@@ -11,33 +11,40 @@ import sys
 import time
 from pathlib import Path
 
-# Correção automática para GDAL_DATA (evita avisos no Windows/Conda)
-if "GDAL_DATA" not in os.environ:
-    gdal_data = Path(sys.exec_prefix) / "Library" / "share" / "gdal"
-    if gdal_data.exists():
-        os.environ["GDAL_DATA"] = str(gdal_data)
+# Bootstrap e higienização de ambiente (PATH, PROJ_DATA, GDAL_DATA)
+try:
+    import _env_bootstrap  # noqa: F401
+except ImportError:
+    pass
 
-import fiona
 import geopandas as gpd
+import pyogrio
 import rasterio
 import rasterio.mask
 from rasterio.features import shapes
-from shapely.geometry import shape
+from shapely.geometry import box, shape
 from shapely.geometry.polygon import orient
 
+
+def _get_required_env(var_name: str, prompt: str) -> str:
+    """Recupera variável de ambiente obrigatória ou solicita entrada interativa."""
+    val = os.environ.get(var_name, "").strip()
+    if val:
+        return val
+    if sys.stdin and sys.stdin.isatty():
+        val = input(prompt).strip()
+        if val:
+            return val
+    raise RuntimeError(
+        f"Configuração obrigatória ausente: variável de ambiente '{var_name}' não definida."
+    )
+
+
 # ── Configuração ───────────────────────────────────────────────────────
-# Lê de variáveis de ambiente (GUI/pipeline) ou solicita via input()
-RASTER_PATH = (
-    os.environ.get("PIPE_RASTER_PATH")
-    or input("Caminho do raster de entrada (.tif): ").strip()
-)
-GRID_PATH = (
-    os.environ.get("PIPE_GRID_PATH")
-    or input("Caminho da grade de articulação (.shp): ").strip()
-)
-OUTPUT_DIR = (
-    os.environ.get("PIPE_TILES_DIR") or input("Pasta de saída para os tiles: ").strip()
-)
+# Lê de variáveis de ambiente (GUI/pipeline) ou solicita via input() em TTY
+RASTER_PATH = _get_required_env("PIPE_RASTER_PATH", "Caminho do raster de entrada (.tif): ")
+GRID_PATH = _get_required_env("PIPE_GRID_PATH", "Caminho da grade de articulação (.shp): ")
+OUTPUT_DIR = _get_required_env("PIPE_TILES_DIR", "Pasta de saída para os tiles: ")
 TARGET_CLASS = int(os.environ.get("PIPE_TARGET_CLASS", "8"))
 
 # Simplificação Douglas-Peucker (tolerância em graus, ~11 m no equador)
@@ -100,10 +107,10 @@ def processar_tile_worker(feature_geometry: dict, tile_id: int) -> str:
             )
 
             out_name = f"Classe{TARGET_CLASS}_Tile_{tile_id}.shp"
-            out_path = os.path.join(OUTPUT_DIR, out_name)
+            out_path = Path(OUTPUT_DIR) / out_name
             gdf.to_file(out_path)
 
-            size_mb = os.path.getsize(out_path) / (1024 * 1024)
+            size_mb = out_path.stat().st_size / (1024 * 1024)
             return f"SUCESSO: Tile {tile_id} | Polígonos: {len(gdf)} | {size_mb:.2f} MB"
 
     except Exception as exc:
@@ -115,24 +122,57 @@ def main_paralelo() -> None:
     Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
     print(f"Lendo grade de articulação: {GRID_PATH}")
-    gdf_grade = gpd.read_file(GRID_PATH)
+    # Leitura inteligente de GPKG com múltiplas camadas (evita ler layer_styles)
+    layer_to_read: str | None = None
+    if GRID_PATH.lower().endswith(".gpkg"):
+        try:
+            layers = pyogrio.list_layers(GRID_PATH)
+            for row in layers:
+                name, geom_type = row[0], row[1]
+                if name != "layer_styles" and geom_type is not None:
+                    layer_to_read = str(name)
+                    break
+        except Exception:
+            layer_to_read = None
+
+    if layer_to_read:
+        gdf_grade = gpd.read_file(GRID_PATH, layer=layer_to_read)
+    else:
+        gdf_grade = gpd.read_file(GRID_PATH)
 
     with rasterio.open(RASTER_PATH) as src:
-        raster_crs_wkt = src.crs.to_wkt()
         print(f"Raster CRS: {src.crs}")
         print(f"Grid CRS: {gdf_grade.crs}")
 
-        if not gdf_grade.crs.equals(raster_crs_wkt):
+        if gdf_grade.crs is None:
+            print(f"  ⚠️  Grade sem CRS definido. Assumindo o mesmo CRS do raster: {src.crs}")
+            gdf_grade = gdf_grade.set_crs(src.crs)
+        elif gdf_grade.crs != src.crs:
             print(
                 f"⚠️  CRS diferentes detectados. Reprojetando grade "
                 f"({gdf_grade.crs} → {src.crs})..."
             )
-            gdf_grade = gdf_grade.to_crs(raster_crs_wkt)
+            gdf_grade = gdf_grade.to_crs(src.crs)
             print("   Grade reprojetada com sucesso.")
+
+        # Filtro espacial prévio: filtra apenas tiles que intersectam o bounding box do raster
+        raster_bbox = box(*src.bounds)
+        total_grade_tiles = len(gdf_grade)
+        gdf_grade = gdf_grade[gdf_grade.intersects(raster_bbox)].copy()
+        print(
+            f"Tiles dentro da área do raster: {len(gdf_grade)} "
+            f"(de {total_grade_tiles} na grade total)"
+        )
+
+    if gdf_grade.empty:
+        print("⚠️  Nenhum tile da grade intersecta a área do raster. Processamento encerrado.")
+        return
 
     tasks = []
     for seq_i, row in enumerate(gdf_grade.itertuples(index=False)):
-        t_id = getattr(row, "id", seq_i)
+        t_id = getattr(row, "id", None)
+        if t_id is None:
+            t_id = getattr(row, "ID", seq_i)
         t_geom = row.geometry.__geo_interface__
         tasks.append((t_geom, t_id))
 

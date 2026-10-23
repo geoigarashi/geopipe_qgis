@@ -19,8 +19,19 @@ try:
 except ImportError:
     pass
 
+import unicodedata
 import geopandas as gpd
 import pandas as pd
+
+
+def strip_accents(text: str) -> str:
+    """Remove accents and normalize non-ASCII characters to standard ASCII."""
+    if not text:
+        return ""
+    text = text.replace("≥", ">=").replace("≤", "<=")
+    normalized = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in normalized if not unicodedata.combining(c))
+
 
 def _get_required_env(var_name: str, prompt: str) -> str:
     """Recupera variável de ambiente obrigatória ou solicita entrada interativa."""
@@ -45,9 +56,9 @@ OUTPUT_DIR = Path(
 )
 TARGET_SIZE_MB = int(os.environ.get("PIPE_TARGET_SIZE_MB", "300"))
 
-# Novos campos customizados
-ATTR_FAIXA = os.environ.get("PIPE_ATTR_FAIXA", "")
-ATTR_NOME = os.environ.get("PIPE_ATTR_NOME", "")
+# Novos campos customizados (higienizados sem acentuação)
+ATTR_FAIXA = strip_accents(os.environ.get("PIPE_ATTR_FAIXA", ""))
+ATTR_NOME = strip_accents(os.environ.get("PIPE_ATTR_NOME", ""))
 TARGET_CLASS = int(os.environ.get("PIPE_TARGET_CLASS", "8"))
 
 BYTES_PER_MB = 1024 * 1024
@@ -133,7 +144,9 @@ def merge_and_save(file_list: list[Path], part_number: int, fid_start: int) -> i
     print(f"4. Gravando {qtd_poligonos:,} polígonos com schema customizado...")
     try:
         # engine="fiona" é necessário para respeitar o schema detalhado
-        merged_gdf.to_file(out_path, engine="fiona", schema=custom_schema)
+        merged_gdf.to_file(
+            out_path, engine="fiona", schema=custom_schema, encoding="utf-8"
+        )
 
         t1 = time.time()
         final_size = os.path.getsize(out_path) / BYTES_PER_MB

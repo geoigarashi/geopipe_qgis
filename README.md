@@ -159,7 +159,18 @@ geopipe_qgis/
 
 ## Histórico de Versões
 
-### 1.1.0
+### 1.2.1
+- **Fix** — Preservação obrigatória de `.cpg` em `prepare_for_upload.py`, eliminando a corrupção de caracteres em leituras de shapefiles no QGIS.
+- **Fix** — Sanitização estrita ASCII das descrições de declividade e atributos customizados (remoção preventiva de acentos para compatibilidade DBF/Oracle SIG).
+- **UX** — Visibilidade dinâmica contextual do campo `UF:` na interface: ocultado automaticamente para o modo Declividade e para classes com schema sem UF (Benfeitorias e Agrícolas do BB Valoração); exibido com rótulo correto para Matas Nativas/Corpos d'água.
+- **Refactor** — Adicionado parâmetro explícito `encoding="utf-8"` nas chamadas de escrita do Fiona.
+
+### 1.2.0
+- **Feature** — Pré-filtro espacial da grade por bounding box do raster antes do processamento multi-CPU.
+- **Perf** — Merge vetorizado em C com contagem de vértices via `shapely.get_num_coordinates`.
+- **Fix** — Prevenção de deadlocks de I/O em background via `_get_required_env()`.
+- **Fix** — Eliminação de processos zumbis com `taskkill /F /T` no Windows.
+- **UX** — Sugestão automática de Max Workers baseada na CPU (`cpu_count - 2`).
 - **Fix** — janela de terminal não aparece mais durante a execução de cada etapa (`CREATE_NO_WINDOW`)
 - **Fix** — log exibido linha a linha em tempo real (flag `-u` no subprocesso + migração para `QPlainTextEdit`)
 - **Fix** — estado dos checkboxes de etapas e da opção "Limpar tiles" agora persistido entre sessões

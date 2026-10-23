@@ -59,7 +59,7 @@ if not _upload_env and not os.environ.get("PIPE_OUTPUT_DIR"):
 OUTPUT_DIR = Path(_upload_env) if _upload_env else INPUT_DIR.parent / "Upload_Prontos"
 
 BYTES_PER_MB = 1024 * 1024
-EXCLUDED_EXTENSIONS = {".cpg", ".qix"}
+EXCLUDED_EXTENSIONS = {".qix"}
 
 
 def preparar_para_upload() -> None:
@@ -95,7 +95,7 @@ def preparar_para_upload() -> None:
         with zipfile.ZipFile(zip_path, "r") as zf:
             zf.extractall(shape_dir)
 
-        # Remover arquivos com extensões indesejadas (.cpg, .qix)
+        # Remover arquivos com extensões indesejadas (.qix)
         for file in list(shape_dir.iterdir()):
             if file.is_file() and file.suffix.lower() in EXCLUDED_EXTENSIONS:
                 file.unlink()

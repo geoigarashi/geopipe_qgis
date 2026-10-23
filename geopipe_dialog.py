@@ -127,7 +127,7 @@ DN_CLASSES_DECLIVIDADE: dict[int, str] = {
 }
 DECLIV_DEFAULTS: dict[int, tuple[str, str]] = {
     1: (
-        "0% a 20% - Aprovação Automatica para todas as culturas (Graos, Cana, etc.). Risco agronômico mínimo.",
+        "0% a 20% - Aprovacao Automatica para todas as culturas (Graos, Cana, etc.). Risco agronomico minimo.",
         "Apta",
     ),
     2: (
@@ -139,11 +139,11 @@ DECLIV_DEFAULTS: dict[int, tuple[str, str]] = {
         "Manual",
     ),
     4: (
-        "75% a <100% - Recusa Tecnica. Alto risco de inadimplencia por quebra de safra/custo operacional e risco de segurança do trabalho.",
+        "75% a <100% - Recusa Tecnica. Alto risco de inadimplencia por quebra de safra/custo operacional e risco de seguranca do trabalho.",
         "Extrema",
     ),
     5: (
-        "≥ 100% - Bloqueio Juridico. Financiamento vedado. Area de Preservacao Permanente de Encosta.",
+        ">= 100% - Bloqueio Juridico. Financiamento vedado. Area de Preservacao Permanente de Encosta.",
         "APP Legal",
     ),
 }
@@ -896,12 +896,16 @@ class GeoPipeDialog(QDialog):
         self._wgt_dinamico.setVisible(False)
 
         if mode == "padrao":
-            self._show_standard_fields()
+            self._lbl_descrico.setVisible(True)
+            self._desc_edit.setVisible(True)
             self._btn_ler_raster.setVisible(False)
             self._cmb_dn.setEnabled(True)
             self._update_dn_options(DN_CLASSES)
         elif mode == "declividade":
-            self._show_standard_fields()
+            self._lbl_descrico.setVisible(True)
+            self._desc_edit.setVisible(True)
+            self._lbl_uf.setVisible(False)
+            self._uf_edit.setVisible(False)
             self._btn_ler_raster.setVisible(False)
             self._cmb_dn.setEnabled(True)
             self._update_dn_options(DN_CLASSES_DECLIVIDADE)
@@ -914,11 +918,32 @@ class GeoPipeDialog(QDialog):
             self._cmb_dn.clear()
             self._wgt_dinamico.setVisible(True)
 
+        self._update_uf_visibility()
+
+    def _update_uf_visibility(self):
+        """Ajusta a visibilidade do campo UF conforme o schema parametrizado no SIG corporativo."""
+        if self._rb_decl.isChecked() or self._rb_din.isChecked():
+            self._lbl_uf.setVisible(False)
+            self._uf_edit.setVisible(False)
+            self._lbl_descrico.setText("Descrição:")
+            return
+
+        dn = self._cmb_dn.currentData()
+        # Classes do padrão BB Valoração (sem UF no SIG corporativo)
+        bb_classes = [1, 2, 3, 4, 6, 10]
+        if dn in bb_classes:
+            self._lbl_uf.setVisible(False)
+            self._uf_edit.setVisible(False)
+            self._lbl_descrico.setText("CLASSES_BB:")
+        else:
+            self._lbl_uf.setVisible(True)
+            self._uf_edit.setVisible(True)
+            self._lbl_descrico.setText("Descrição:")
+
     def _show_standard_fields(self):
-        self._lbl_uf.setVisible(True)
-        self._uf_edit.setVisible(True)
         self._lbl_descrico.setVisible(True)
         self._desc_edit.setVisible(True)
+        self._update_uf_visibility()
 
     def _hide_standard_fields(self):
         self._lbl_uf.setVisible(False)
@@ -970,6 +995,7 @@ class GeoPipeDialog(QDialog):
             self._update_custom_defaults()
         else:
             self._desc_edit.setText(DN_CLASSES.get(dn, ""))
+        self._update_uf_visibility()
 
     def _get_selected_dn(self) -> str:
         dn = self._cmb_dn.currentData()

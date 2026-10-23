@@ -221,7 +221,9 @@ def merge_and_save(file_list: list[Path], part_number: int, fid_start: int) -> i
 
     print(f"4. Gravando {qtd_poligonos:,} polígonos com schema Oracle SIG...")
     try:
-        merged_gdf.to_file(out_path, engine="fiona", schema=oracle_schema)
+        merged_gdf.to_file(
+            out_path, engine="fiona", schema=oracle_schema, encoding="utf-8"
+        )
 
         t1 = time.time()
         final_size = os.path.getsize(out_path) / BYTES_PER_MB
